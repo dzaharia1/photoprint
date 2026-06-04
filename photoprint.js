@@ -190,8 +190,8 @@ async function doPrint(batch, cfg, auto) {
 }
 
 // ─── Render ───────────────────────────────────────────────────────────────────
-const HDR = 7;
-const FTR = 2;
+const HDR = 5;
+const FTR = 3;
 
 function render(state) {
   const w = TW(), h = TH();
@@ -217,10 +217,7 @@ function render(state) {
   ].join('  |  ');
   s += ` ${A.gray}${cfgLine}${A.reset}\n`;
 
-  // Line 3: blank
-  s += '\n';
-
-  // Line 4: space bar
+  // Line 3: space bar
   const barW   = Math.max(10, w - 32);
   const fill   = Math.round(pct * barW);
   const barCol = pct > 0.95 ? A.red : pct > 0.75 ? A.yellow : A.green;
@@ -230,10 +227,7 @@ function render(state) {
   // Line 5: counts
   s += ` ${A.gray}${sel.length} selected  |  ${unprinted} unprinted  |  ${state.images.length} total${A.reset}\n`;
 
-  // Line 6: controls
-  s += ` ${A.gray}up/down navigate   SPACE select   P print   A auto-batch all   Q quit${A.reset}\n`;
-
-  // Line 7: separator
+  // Line 6: separator
   s += ` ${A.gray}${'-'.repeat(w - 2)}${A.reset}\n`;
 
   // Image list
@@ -256,34 +250,52 @@ function render(state) {
     else                                  glyph = `${A.gray}[ ]${A.reset}`;
 
     const dot     = img.tag ? ` ${TAG_DOT[img.tag]}` : '  ';
-    const rot     = img.h > img.w ? 'R ' : '  ';
+    const rot     = img.h > img.w ? ' R' : '  ';
     const ph      = printH(img, state.longerDim);
     const dim     = `${state.longerDim.toFixed(1)}x${ph.toFixed(2)}"`;
-    const nameW   = Math.max(10, w - 22);
+    const nameW   = Math.max(10, w - 20);
     const base    = img.name.replace(/\.[^.]+$/, '');
     const nameStr = trunc(base, nameW).padEnd(nameW);
 
     let row;
     if (isGrayed) {
-      row = `${A.gray} ${glyph}${dot} ${nameStr}  ${dim}  ${rot}${A.reset}`;
+      row = `${A.gray} ${glyph}${dot} ${nameStr} ${dim}${rot}${A.reset}`;
     } else if (img.printed && !img.selected) {
-      row = ` ${glyph}${dot} ${A.dim}${nameStr}${A.reset}  ${A.gray}${dim}  printed${A.reset}`;
+      row = ` ${glyph}${dot} ${A.dim}${nameStr}${A.reset} ${A.gray}${dim} printed${A.reset}`;
     } else {
       const nc = img.selected ? `${A.green}${A.bold}` : '';
-      row = ` ${glyph}${dot} ${nc}${nameStr}${A.reset}  ${A.gray}${dim}  ${rot}${A.reset}`;
+      row = ` ${glyph}${dot} ${nc}${nameStr}${A.reset} ${A.gray}${dim}${rot}${A.reset}`;
     }
 
     const cur = isCursor ? `${A.cyan}>${A.reset}` : ' ';
     s += cur + row + '\n';
   }
 
-  // Footer
-  s += '\n';
-  if (sel.length > 0)
-    s += ` ${A.green}${A.bold}[P]${A.reset} Print ${sel.length} image${sel.length !== 1 ? 's' : ''}   `;
+  // Footer (3 lines)
+  s += ` ${A.gray}${'-'.repeat(w - 2)}${A.reset}\n`;
+
+  // Controls reference
+  const keys = [
+    `${A.reset}[↑↓]${A.gray} navigate`,
+    `${A.reset}[SPACE]${A.gray} select/deselect`,
+    `${A.reset}[R]${A.gray} select all red`,
+    `${A.reset}[P]${A.gray} print selection`,
+    `${A.reset}[A]${A.gray} auto-batch all`,
+    `${A.reset}[Q]${A.gray} quit`,
+  ].join(`  ${A.reset}`);
+  s += ` ${A.gray}${keys}${A.reset}\n`;
+
+  // Action line
+  const unprintedUnsel = state.images.filter(i => !i.selected && !i.printed);
+  const pageFull = sel.length > 0 && unprintedUnsel.length > 0 &&
+    unprintedUnsel.every(i => !wouldFit(i, sel, state.longerDim, state.paperH));
+
+  if (pageFull)
+    s += ` ${A.orange}${A.bold}Page full — no more images will fit. Press P to print.${A.reset}`;
+  else if (sel.length > 0)
+    s += ` ${A.green}${A.bold}[P]${A.reset} Print ${sel.length} image${sel.length !== 1 ? 's' : ''}`;
   else
-    s += ' ';
-  s += `${A.gray}[A] Auto-batch all   [Q] Quit${A.reset}`;
+    s += ` ${A.gray}No images selected — SPACE to select, R to select all red-tagged${A.reset}`;
 
   out(s);
 }
@@ -367,6 +379,18 @@ async function selectionLoop(state) {
       } else if (img.printed || wouldFit(img, sel(), state.longerDim, state.paperH)) {
         img.selected = true;
       }
+    } else if (key === 'r' || key === 'R') {
+      // Select all red-tagged images that fit, in order; deselect all if already all selected
+      const redImgs = state.images.filter(i => i.tag === 'Red' && !i.printed);
+      const allRedSelected = redImgs.length > 0 && redImgs.every(i => i.selected);
+      state.images.forEach(i => { i.selected = false; });
+      if (!allRedSelected) {
+        for (const img of redImgs) {
+          const cur = state.images.filter(i => i.selected);
+          if (wouldFit(img, cur, state.longerDim, state.paperH)) img.selected = true;
+        }
+      }
+
     } else if (key === 'p' || key === 'P' || key === '\r') {
       const batch = sel();
       if (batch.length) {
