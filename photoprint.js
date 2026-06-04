@@ -7,200 +7,411 @@ const path = require('path');
 const os = require('os');
 const fs = require('fs');
 
-// ─── helpers ──────────────────────────────────────────────────────────────────
+// ─── ANSI ─────────────────────────────────────────────────────────────────────
+const A = {
+  reset:   '\x1b[0m',  bold:    '\x1b[1m',
+  dim:     '\x1b[2m',  strike:  '\x1b[9m',
+  altOn:   '\x1b[?1049h', altOff: '\x1b[?1049l',
+  hideC:   '\x1b[?25l',   showC:  '\x1b[?25h',
+  clr:     '\x1b[2J\x1b[H',
+  red:     '\x1b[31m', green:  '\x1b[32m',
+  yellow:  '\x1b[33m', blue:   '\x1b[34m',
+  magenta: '\x1b[35m', cyan:   '\x1b[36m',
+  gray:    '\x1b[90m', orange: '\x1b[38;5;208m',
+};
 
-const rl = readline.createInterface({ input: process.stdin, output: process.stdout });
-process.on('SIGINT', () => { console.log('\nAborted.'); rl.close(); process.exit(0); });
+const TW = () => process.stdout.columns || 100;
+const TH = () => process.stdout.rows    || 30;
+const out = s => process.stdout.write(s);
+const trunc = (s, n) => s.length > n ? s.slice(0, n - 1) + '…' : s;
 
-function ask(prompt) {
-  return new Promise(resolve => rl.question(prompt, a => resolve(a.trim())));
-}
+const TAG_DOT = {
+  Red:    `${A.red}●${A.reset}`,
+  Orange: `${A.orange}●${A.reset}`,
+  Yellow: `${A.yellow}●${A.reset}`,
+  Green:  `${A.green}●${A.reset}`,
+  Blue:   `${A.blue}●${A.reset}`,
+  Purple: `${A.magenta}●${A.reset}`,
+  Gray:   `${A.dim}●${A.reset}`,
+};
 
-async function choose(prompt, options) {
-  console.log(`\n${prompt}`);
-  options.forEach((o, i) => console.log(`  ${i + 1}) ${o.label}`));
-  while (true) {
-    const a = await ask(`  › `);
-    const n = parseInt(a);
-    if (n >= 1 && n <= options.length) return options[n - 1];
-    console.log(`  Please enter 1–${options.length}.`);
-  }
-}
-
-async function confirm(prompt) {
-  const a = await ask(`${prompt} [y/n] › `);
-  return a.toLowerCase().startsWith('y');
-}
-
+// ─── Shell ────────────────────────────────────────────────────────────────────
 function run(cmd) {
   try {
-    return execSync(cmd, { encoding: 'utf8', stdio: ['pipe', 'pipe', 'pipe'] }).trim();
-  } catch (e) {
-    throw new Error(e.stderr?.trim() || e.message);
-  }
+    return execSync(cmd, { encoding: 'utf8', stdio: ['pipe','pipe','pipe'] }).trim();
+  } catch(e) { throw new Error(e.stderr?.trim() || e.message); }
 }
 
-// ─── image utilities ──────────────────────────────────────────────────────────
+// ─── File system ──────────────────────────────────────────────────────────────
+const IMG_EXTS = /\.(tiff?|jpe?g|png|heic|heif|webp)$/i;
 
-function findRedTaggedImages(dir) {
-  const exts = /\.(tiff?|jpe?g|png|heic|heif|webp)$/i;
-  return fs.readdirSync(dir)
-    .filter(f => exts.test(f))
-    .sort((a, b) => a.localeCompare(b, undefined, { numeric: true, sensitivity: 'base' }))
-    .filter(f => {
-      try {
-        const x = run(`xattr -p com.apple.metadata:_kMDItemUserTags "${path.join(dir, f)}"`);
-        return x.includes('Red');
-      } catch { return false; }
-    });
+function finderTag(fp) {
+  try {
+    const x = run(`xattr -p com.apple.metadata:_kMDItemUserTags "${fp}"`);
+    return Object.keys(TAG_DOT).find(t => x.includes(t)) || null;
+  } catch { return null; }
 }
 
-function getDims(filepath) {
-  const out = run(`sips -g pixelWidth -g pixelHeight "${filepath}"`);
-  const w = parseInt(out.match(/pixelWidth:\s*(\d+)/)[1]);
-  const h = parseInt(out.match(/pixelHeight:\s*(\d+)/)[1]);
-  return { w, h };
-}
-
-// Always returns landscape print dims; needsRotate=true if original is portrait
-function calcPrintDims(imgW, imgH, longerDim) {
-  const landscape = imgW >= imgH;
-  const [lPx, sPx] = landscape ? [imgW, imgH] : [imgH, imgW];
+function getDims(fp) {
+  const o = run(`sips -g pixelWidth -g pixelHeight "${fp}"`);
   return {
-    printW: longerDim,
-    printH: longerDim * (sPx / lPx),
-    needsRotate: !landscape,
+    w: parseInt(o.match(/pixelWidth:\s*(\d+)/)[1]),
+    h: parseInt(o.match(/pixelHeight:\s*(\d+)/)[1]),
   };
 }
 
-// ─── layout ───────────────────────────────────────────────────────────────────
+function loadImages(dir) {
+  const files = fs.readdirSync(dir)
+    .filter(f => IMG_EXTS.test(f))
+    .sort((a, b) => a.localeCompare(b, undefined, { numeric: true, sensitivity: 'base' }));
 
-const DPI = 300;
-const MIN_GAP_IN = 0.15; // minimum gap between images, in inches
-
-const PAPER_PRESETS = [
-  { label: '4 × 6"',    w: 4,   h: 6,   cups: 'Custom.288x432'  },
-  { label: '5 × 7"',    w: 5,   h: 7,   cups: 'Custom.360x504'  },
-  { label: '8 × 10"',   w: 8,   h: 10,  cups: 'Custom.576x720'  },
-  { label: '8.5 × 11"', w: 8.5, h: 11,  cups: 'Letter'          },
-  { label: '11 × 14"',  w: 11,  h: 14,  cups: 'Custom.792x1008' },
-  { label: '13 × 19"',  w: 13,  h: 19,  cups: 'Custom.936x1368' },
-  { label: 'Custom…',   w: 0,   h: 0,   cups: ''                 },
-];
-
-// How many images from `images` (starting at index 0) fit on one page
-function calcBatchSize(images, longerDim, paperW, paperH) {
-  let totalH = 0;
-  let count = 0;
-  for (const img of images) {
-    const { printW, printH } = calcPrintDims(img.w, img.h, longerDim);
-    if (printW > paperW) {
-      console.log(`  Warning: "${img.name}" at ${longerDim}" wide exceeds paper width (${paperW}"). Skipping.`);
-      continue;
-    }
-    // n images need n+1 gaps (top, between each, bottom)
-    const wouldFit = totalH + printH + (count + 2) * MIN_GAP_IN <= paperH;
-    if (!wouldFit) break;
-    totalH += printH;
-    count++;
-  }
-  return count;
+  process.stdout.write(`  Reading ${files.length} image(s)`);
+  const images = files.map(name => {
+    process.stdout.write('.');
+    const fp = path.join(dir, name);
+    const { w, h } = getDims(fp);
+    const tag = finderTag(fp);
+    return { name, path: fp, w, h, tag, selected: false, printed: false };
+  });
+  console.log(' done.');
+  return images;
 }
 
-function buildComposite(batch, longerDim, paperW, paperH, outPath) {
-  const pageWpx = Math.round(paperW * DPI);
-  const pageHpx = Math.round(paperH * DPI);
-  const tmpFiles = [];
-  const actualDims = [];
-
-  // Resize each image to final print size
-  for (const img of batch) {
-    const { needsRotate } = calcPrintDims(img.w, img.h, longerDim);
-    const targetWpx = Math.round(longerDim * DPI);
-    const tmp = path.join(os.tmpdir(), `pp_${Date.now()}_${Math.random().toString(36).slice(2)}.tiff`);
-    const rotate = needsRotate ? '-rotate -90' : '';
-    run(`magick "${img.path}" -auto-orient ${rotate} -resize ${targetWpx}x -units PixelsPerInch -density ${DPI} "${tmp}"`);
-    const dims = run(`magick identify -format "%wx%h" "${tmp}"`);
-    const [pw, ph] = dims.split('x').map(Number);
-    tmpFiles.push(tmp);
-    actualDims.push({ pw, ph });
-  }
-
-  // Even spacing: (n+1) equal gaps across full page height
-  const totalImgHpx = actualDims.reduce((s, d) => s + d.ph, 0);
-  const spacingPx = Math.floor((pageHpx - totalImgHpx) / (batch.length + 1));
-
-  // Build composite command
-  let cmd = `magick -size ${pageWpx}x${pageHpx} xc:white -units PixelsPerInch -density ${DPI}`;
-  let y = spacingPx;
-  for (let i = 0; i < tmpFiles.length; i++) {
-    const x = Math.round((pageWpx - actualDims[i].pw) / 2);
-    cmd += ` "${tmpFiles[i]}" -geometry +${x}+${y} -composite`;
-    y += actualDims[i].ph + spacingPx;
-  }
-  cmd += ` "${outPath}"`;
-  run(cmd);
-
-  tmpFiles.forEach(f => { try { fs.unlinkSync(f); } catch {} });
-}
-
-// ─── printer helpers ──────────────────────────────────────────────────────────
-
+// ─── Printers ─────────────────────────────────────────────────────────────────
 function getPrinters() {
   try {
-    return run('lpstat -p')
-      .split('\n')
+    return run('lpstat -p').split('\n')
       .filter(l => l.startsWith('printer '))
       .map(l => l.split(' ')[1]);
   } catch { return []; }
 }
 
-function getPrinterOptValues(printer, key) {
+function getPrinterVals(printer, key) {
   try {
-    const out = run(`lpoptions -p "${printer}" -l`);
-    const line = out.split('\n').find(l => l.startsWith(key + '/') || l.startsWith(key + ':'));
+    const o = run(`lpoptions -p "${printer}" -l`);
+    const line = o.split('\n').find(l => l.startsWith(key + '/') || l.startsWith(key + ':'));
     if (!line) return [];
     return line.split(':')[1].trim().split(/\s+/).map(v => v.replace(/^\*/, ''));
   } catch { return []; }
 }
 
-// ─── main ─────────────────────────────────────────────────────────────────────
+// ─── Layout ───────────────────────────────────────────────────────────────────
+const DPI     = 300;
+const MIN_GAP = 0.15;
 
-async function main() {
-  const dir = process.cwd();
-  console.log(`\nPhotoprint — scanning ${path.basename(dir)} for red-tagged images…`);
+const PAPER = [
+  { label: '4 x 6"',    w: 4,   h: 6,  cups: 'Custom.288x432'  },
+  { label: '5 x 7"',    w: 5,   h: 7,  cups: 'Custom.360x504'  },
+  { label: '8 x 10"',   w: 8,   h: 10, cups: 'Custom.576x720'  },
+  { label: '8.5 x 11"', w: 8.5, h: 11, cups: 'Letter'          },
+  { label: '11 x 14"',  w: 11,  h: 14, cups: 'Custom.792x1008' },
+  { label: '13 x 19"',  w: 13,  h: 19, cups: 'Custom.936x1368' },
+  { label: 'Custom',    w: 0,   h: 0,  cups: ''                },
+];
 
-  // Find images
-  const filenames = findRedTaggedImages(dir);
-  if (!filenames.length) {
-    console.log('No red-tagged images found. Tag images with a red label in Finder first.');
-    rl.close(); return;
+const MEDIA_LABEL = {
+  photographic: 'Photo Glossy/Lustre',
+  stationery:   'Matte',
+  envelope:     'Envelope',
+  any:          'Auto',
+};
+
+function printH(img, longerDim) {
+  const [l, s] = img.w >= img.h ? [img.w, img.h] : [img.h, img.w];
+  return longerDim * (s / l);
+}
+
+function spaceUsed(imgs, longerDim) {
+  if (!imgs.length) return 0;
+  return imgs.reduce((s, i) => s + printH(i, longerDim), 0) + (imgs.length + 1) * MIN_GAP;
+}
+
+function wouldFit(img, selected, longerDim, paperH) {
+  return spaceUsed([...selected, img], longerDim) <= paperH;
+}
+
+// ─── Composite builder ────────────────────────────────────────────────────────
+function buildComposite(images, cfg, outPath) {
+  const { longerDim, paperW, paperH } = cfg;
+  const pw = Math.round(paperW * DPI);
+  const ph = Math.round(paperH * DPI);
+  const tmps = [], adims = [];
+
+  for (const img of images) {
+    const rotate = img.h > img.w ? '-rotate -90' : '';
+    const tw  = Math.round(longerDim * DPI);
+    const tmp = path.join(os.tmpdir(), `pp_${Date.now()}_${Math.random().toString(36).slice(2)}.tiff`);
+    run(`magick "${img.path}" -auto-orient ${rotate} -resize ${tw}x -units PixelsPerInch -density ${DPI} "${tmp}"`);
+    const d = run(`magick identify -format "%wx%h" "${tmp}"`).split('x').map(Number);
+    tmps.push(tmp);
+    adims.push({ w: d[0], h: d[1] });
   }
-  console.log(`Found ${filenames.length} red-tagged image(s).`);
 
-  // Pre-read all dimensions
-  process.stdout.write('Reading dimensions');
-  const images = filenames.map(name => {
-    process.stdout.write('.');
-    const fp = path.join(dir, name);
-    const { w, h } = getDims(fp);
-    return { name, path: fp, w, h };
-  });
-  console.log(' done.\n');
+  const totalH = adims.reduce((s, d) => s + d.h, 0);
+  const gap    = Math.floor((ph - totalH) / (images.length + 1));
 
-  // Printer selection
+  let cmd = `magick -size ${pw}x${ph} xc:white -units PixelsPerInch -density ${DPI}`;
+  let y = gap;
+  for (let i = 0; i < tmps.length; i++) {
+    const x = Math.round((pw - adims[i].w) / 2);
+    cmd += ` "${tmps[i]}" -geometry +${x}+${y} -composite`;
+    y += adims[i].h + gap;
+  }
+  cmd += ` "${outPath}"`;
+  run(cmd);
+  tmps.forEach(f => { try { fs.unlinkSync(f); } catch {} });
+}
+
+// ─── Print ────────────────────────────────────────────────────────────────────
+async function doPrint(batch, cfg, auto) {
+  const outTiff = path.join(os.tmpdir(), `photoprint_${Date.now()}.tiff`);
+  const prevJpg = outTiff.replace('.tiff', '_prev.jpg');
+
+  process.stdout.write(`\nBuilding composite for ${batch.length} image(s)...`);
+  buildComposite(batch, cfg, outTiff);
+  console.log(' done.');
+
+  if (!auto) {
+    run(`magick "${outTiff}" -resize 900x "${prevJpg}"`);
+    run(`open "${prevJpg}"`);
+    console.log('Preview opened.\n');
+    const rl = readline.createInterface({ input: process.stdin, output: process.stdout });
+    const ans = await new Promise(r => rl.question('Print? [y/n] > ', a => { rl.close(); r(a.trim()); }));
+    if (!ans.toLowerCase().startsWith('y')) return false;
+  }
+
+  const res = run(
+    `lp -d "${cfg.printer}" -o PageSize=${cfg.cupsPaperSize} -o InputSlot=${cfg.inputSlot} -o MediaType=${cfg.mediaType} -o scaling=100 "${outTiff}"`
+  );
+  console.log(`Sent -- ${res}`);
+  batch.forEach(img => { img.printed = true; img.selected = false; });
+  if (!auto) await new Promise(r => setTimeout(r, 1000));
+  return true;
+}
+
+// ─── Render ───────────────────────────────────────────────────────────────────
+const HDR = 7;
+const FTR = 2;
+
+function render(state) {
+  const w = TW(), h = TH();
+  const listH    = h - HDR - FTR;
+  const sel      = state.images.filter(i => i.selected);
+  const used     = spaceUsed(sel, state.longerDim);
+  const pct      = Math.min(1, used / state.paperH);
+  const left     = Math.max(0, state.paperH - used);
+  const unprinted = state.images.filter(i => !i.printed).length;
+
+  let s = A.clr;
+
+  // Line 1: title
+  s += `${A.bold}${A.cyan} PhotoPrint${A.reset}  ${A.gray}${path.basename(state.dir)}${A.reset}\n`;
+
+  // Line 2: config
+  const cfgLine = [
+    `${state.longerDim}" per image`,
+    `paper ${state.paperW}x${state.paperH}"`,
+    `tray: ${state.inputSlot}`,
+    `media: ${MEDIA_LABEL[state.mediaType] || state.mediaType}`,
+    state.printer,
+  ].join('  |  ');
+  s += ` ${A.gray}${cfgLine}${A.reset}\n`;
+
+  // Line 3: blank
+  s += '\n';
+
+  // Line 4: space bar
+  const barW   = Math.max(10, w - 32);
+  const fill   = Math.round(pct * barW);
+  const barCol = pct > 0.95 ? A.red : pct > 0.75 ? A.yellow : A.green;
+  s += ` ${barCol}${'#'.repeat(fill)}${A.gray}${'-'.repeat(barW - fill)}${A.reset}`;
+  s += `  ${A.bold}${used.toFixed(2)}"${A.reset} used  ${A.gray}${left.toFixed(2)}" left${A.reset}\n`;
+
+  // Line 5: counts
+  s += ` ${A.gray}${sel.length} selected  |  ${unprinted} unprinted  |  ${state.images.length} total${A.reset}\n`;
+
+  // Line 6: controls
+  s += ` ${A.gray}up/down navigate   SPACE select   P print   A auto-batch all   Q quit${A.reset}\n`;
+
+  // Line 7: separator
+  s += ` ${A.gray}${'-'.repeat(w - 2)}${A.reset}\n`;
+
+  // Image list
+  const visible = state.images.slice(state.scrollOffset, state.scrollOffset + listH);
+
+  for (let vi = 0; vi < listH; vi++) {
+    const img = visible[vi];
+    if (!img) { s += '\n'; continue; }
+
+    const ai       = state.scrollOffset + vi;
+    const isCursor = ai === state.cursor;
+    const isGrayed = !img.selected && !img.printed &&
+                     !wouldFit(img, sel, state.longerDim, state.paperH);
+
+    // Selection glyph
+    let glyph;
+    if      (img.selected && img.printed) glyph = `${A.yellow}[*]${A.reset}`;
+    else if (img.selected)                glyph = `${A.green}${A.bold}[+]${A.reset}`;
+    else if (img.printed)                 glyph = `${A.gray}[v]${A.reset}`;
+    else                                  glyph = `${A.gray}[ ]${A.reset}`;
+
+    const dot     = img.tag ? ` ${TAG_DOT[img.tag]}` : '  ';
+    const rot     = img.h > img.w ? 'R ' : '  ';
+    const ph      = printH(img, state.longerDim);
+    const dim     = `${state.longerDim.toFixed(1)}x${ph.toFixed(2)}"`;
+    const nameW   = Math.max(10, w - 22);
+    const base    = img.name.replace(/\.[^.]+$/, '');
+    const nameStr = trunc(base, nameW).padEnd(nameW);
+
+    let row;
+    if (isGrayed) {
+      row = `${A.gray} ${glyph}${dot} ${nameStr}  ${dim}  ${rot}${A.reset}`;
+    } else if (img.printed && !img.selected) {
+      row = ` ${glyph}${dot} ${A.dim}${nameStr}${A.reset}  ${A.gray}${dim}  printed${A.reset}`;
+    } else {
+      const nc = img.selected ? `${A.green}${A.bold}` : '';
+      row = ` ${glyph}${dot} ${nc}${nameStr}${A.reset}  ${A.gray}${dim}  ${rot}${A.reset}`;
+    }
+
+    const cur = isCursor ? `${A.cyan}>${A.reset}` : ' ';
+    s += cur + row + '\n';
+  }
+
+  // Footer
+  s += '\n';
+  if (sel.length > 0)
+    s += ` ${A.green}${A.bold}[P]${A.reset} Print ${sel.length} image${sel.length !== 1 ? 's' : ''}   `;
+  else
+    s += ' ';
+  s += `${A.gray}[A] Auto-batch all   [Q] Quit${A.reset}`;
+
+  out(s);
+}
+
+// ─── Raw mode helpers ─────────────────────────────────────────────────────────
+function enterRaw() {
+  process.stdin.setRawMode(true);
+  process.stdin.resume();
+  process.stdin.setEncoding('utf8');
+  out(A.altOn + A.hideC);
+}
+
+function exitRaw() {
+  process.stdin.setRawMode(false);
+  process.stdin.pause();
+  out(A.altOff + A.showC);
+}
+
+function readKey() {
+  return new Promise(resolve => process.stdin.once('data', resolve));
+}
+
+// ─── Auto mode ────────────────────────────────────────────────────────────────
+async function autoMode(state) {
+  while (true) {
+    const unprinted = state.images.filter(i => !i.printed);
+    if (!unprinted.length) break;
+
+    state.images.forEach(i => { i.selected = false; });
+    for (const img of unprinted) {
+      const sel = state.images.filter(i => i.selected);
+      if (wouldFit(img, sel, state.longerDim, state.paperH)) img.selected = true;
+      else break;
+    }
+
+    const batch = state.images.filter(i => i.selected);
+    if (!batch.length) break;
+
+    console.log(`\n-- Auto batch: ${batch.length} image(s)  |  ${unprinted.length} unprinted remaining --`);
+    await doPrint(batch, state, true);
+  }
+
+  const stillLeft = state.images.filter(i => !i.printed).length;
+  if (stillLeft)
+    console.log(`\n${stillLeft} image(s) could not fit on a single page -- use manual mode.`);
+  else
+    console.log('\nAll images printed.');
+  await new Promise(r => setTimeout(r, 1500));
+}
+
+// ─── Selection loop ───────────────────────────────────────────────────────────
+async function selectionLoop(state) {
+  enterRaw();
+  render(state);
+
+  const listH = () => TH() - HDR - FTR;
+
+  while (true) {
+    const key = await readKey();
+    const sel = () => state.images.filter(i => i.selected);
+
+    if (key === '\x03' || key === 'q' || key === 'Q') {
+      exitRaw(); return;
+    }
+
+    if (key === '\x1b[A' || key === 'k') {
+      if (state.cursor > 0) {
+        state.cursor--;
+        if (state.cursor < state.scrollOffset) state.scrollOffset = state.cursor;
+      }
+    } else if (key === '\x1b[B' || key === 'j') {
+      if (state.cursor < state.images.length - 1) {
+        state.cursor++;
+        const lh = listH();
+        if (state.cursor >= state.scrollOffset + lh) state.scrollOffset = state.cursor - lh + 1;
+      }
+    } else if (key === ' ') {
+      const img = state.images[state.cursor];
+      if (img.selected) {
+        img.selected = false;
+      } else if (img.printed || wouldFit(img, sel(), state.longerDim, state.paperH)) {
+        img.selected = true;
+      }
+    } else if (key === 'p' || key === 'P' || key === '\r') {
+      const batch = sel();
+      if (batch.length) {
+        exitRaw();
+        console.clear();
+        await doPrint(batch, state, false);
+        enterRaw();
+      }
+    } else if (key === 'a' || key === 'A') {
+      exitRaw();
+      console.clear();
+      await autoMode(state);
+      enterRaw();
+    }
+
+    render(state);
+  }
+}
+
+// ─── Setup (readline mode) ────────────────────────────────────────────────────
+async function setup() {
+  const rl  = readline.createInterface({ input: process.stdin, output: process.stdout });
+  const ask = p => new Promise(r => rl.question(p, a => r(a.trim())));
+  const choose = async (prompt, opts) => {
+    console.log(`\n${prompt}`);
+    opts.forEach((o, i) => console.log(`  ${i + 1}) ${o.label}`));
+    while (true) {
+      const a = await ask('  > ');
+      const n = parseInt(a);
+      if (n >= 1 && n <= opts.length) return opts[n - 1];
+      console.log(`  Enter 1-${opts.length}.`);
+    }
+  };
+
+  console.log('\nPhotoprint  --  interactive photo printing\n');
+
+  // Printer
   const printers = getPrinters();
-  if (!printers.length) {
-    console.log('No printers found. Make sure your printer is connected and enabled.');
-    rl.close(); return;
-  }
+  if (!printers.length) { rl.close(); throw new Error('No printers found.'); }
   let printer;
   if (printers.length === 1) {
     printer = printers[0];
     console.log(`Printer: ${printer}`);
   } else {
-    const p = await choose('Select printer:', printers.map(label => ({ label })));
-    printer = p.label;
+    printer = (await choose('Select printer:', printers.map(l => ({ label: l })))).label;
   }
 
   // Longer dimension
@@ -208,8 +419,8 @@ async function main() {
   const longerDim = parseFloat(dimIn) || 8;
 
   // Paper size
-  const paperChoice = await choose('Paper size:', PAPER_PRESETS.map(p => ({ label: p.label, ...p })));
-  let paperW = paperChoice.w, paperH = paperChoice.h, cupsPaperSize = paperChoice.cups;
+  const pc = await choose('Paper size:', PAPER.map(p => ({ label: p.label, ...p })));
+  let paperW = pc.w, paperH = pc.h, cupsPaperSize = pc.cups;
   if (!paperW) {
     paperW = parseFloat(await ask('Paper width (inches): '));
     paperH = parseFloat(await ask('Paper height (inches): '));
@@ -217,83 +428,55 @@ async function main() {
   }
 
   // Paper type
-  const mediaTypes = getPrinterOptValues(printer, 'MediaType');
-  const mediaLabels = { photographic: 'Photo Glossy/Lustre', stationery: 'Matte', envelope: 'Envelope', any: 'Auto' };
-  const mediaOptions = [
-    ...mediaTypes.map(m => ({ label: mediaLabels[m] || m, value: m })),
-    { label: 'Custom…', value: '__custom__' },
+  const mediaTypes = getPrinterVals(printer, 'MediaType');
+  const mediaOpts  = [
+    ...mediaTypes.map(m => ({ label: MEDIA_LABEL[m] || m, value: m })),
+    { label: 'Custom', value: '__custom__' },
   ];
-  const mediaChoice = await choose('Paper type:', mediaOptions);
-  const mediaType = mediaChoice.value === '__custom__'
-    ? await ask('CUPS MediaType value: ')
-    : mediaChoice.value;
+  const mc = await choose('Paper type:', mediaOpts);
+  const mediaType = mc.value === '__custom__' ? await ask('CUPS MediaType: ') : mc.value;
 
-  // Input slot
-  const slots = getPrinterOptValues(printer, 'InputSlot');
+  // Tray
+  const slots = getPrinterVals(printer, 'InputSlot');
   let inputSlot = 'auto';
   if (slots.length > 1) {
-    const slotChoice = await choose('Paper tray:', slots.map(s => ({ label: s, value: s })));
-    inputSlot = slotChoice.value;
+    inputSlot = (await choose('Paper tray:', slots.map(s => ({ label: s, value: s })))).value;
   }
 
-  // Initial batch size estimate
-  const firstBatchSize = calcBatchSize(images, longerDim, paperW, paperH);
-  if (!firstBatchSize) {
-    console.log(`\nImages at ${longerDim}" don't fit on ${paperW}×${paperH}" paper. Try a smaller size.`);
-    rl.close(); return;
-  }
-  const estPages = Math.ceil(images.length / firstBatchSize);
-  console.log(`\n~${firstBatchSize} image(s) per page → ~${estPages} page(s) for ${images.length} images.\n`);
-
-  // Batch loop
-  let offset = 0, pageNum = 1;
-  while (offset < images.length) {
-    const remaining = images.slice(offset);
-    const batchSize = calcBatchSize(remaining, longerDim, paperW, paperH);
-    if (!batchSize) break;
-
-    const batch = remaining.slice(0, batchSize);
-    const totalPages = Math.ceil(images.length / batchSize); // recalculate per batch
-    console.log(`── Page ${pageNum}: images ${offset + 1}–${offset + batch.length} of ${images.length} ──`);
-    batch.forEach((img, i) => console.log(`  ${offset + i + 1}. ${img.name}`));
-
-    process.stdout.write('\nBuilding composite…');
-    const outTiff = path.join(os.tmpdir(), `photoprint_p${pageNum}.tiff`);
-    buildComposite(batch, longerDim, paperW, paperH, outTiff);
-    console.log(' done.');
-
-    // Preview
-    const previewJpg = outTiff.replace('.tiff', '_preview.jpg');
-    run(`magick "${outTiff}" -resize 900x "${previewJpg}"`);
-    run(`open "${previewJpg}"`);
-    console.log('Preview opened in Preview.app.\n');
-
-    const doPrint = await confirm('Print this page?');
-    if (doPrint) {
-      const result = run(
-        `lp -d "${printer}" -o PageSize=${cupsPaperSize} -o InputSlot=${inputSlot} -o MediaType=${mediaType} -o scaling=100 "${outTiff}"`
-      );
-      console.log(`Sent to printer — ${result}`);
-    } else {
-      console.log('Skipped.');
-    }
-
-    offset += batch.length;
-    pageNum++;
-
-    if (offset < images.length) {
-      const nextCount = calcBatchSize(images.slice(offset), longerDim, paperW, paperH);
-      const doNext = await confirm(`\nPrepare next page (${nextCount} image${nextCount !== 1 ? 's' : ''})?`);
-      if (!doNext) { console.log('Done.'); break; }
-    }
-  }
-
-  if (offset >= images.length) console.log('\nAll images processed.');
   rl.close();
+  return { printer, longerDim, paperW, paperH, cupsPaperSize, mediaType, inputSlot };
+}
+
+// ─── Main ─────────────────────────────────────────────────────────────────────
+async function main() {
+  const dir = process.cwd();
+
+  try { run('which magick'); } catch {
+    console.error('ImageMagick not found. Run: brew install imagemagick');
+    process.exit(1);
+  }
+
+  const cfg    = await setup();
+  console.log();
+  const images = loadImages(dir);
+  if (!images.length) { console.log('No images found.'); process.exit(0); }
+
+  const state = { dir, images, cursor: 0, scrollOffset: 0, ...cfg };
+
+  process.stdout.on('resize', () => render(state));
+  process.on('exit', () => out(A.altOff + A.showC));
+  process.on('uncaughtException', err => {
+    out(A.altOff + A.showC);
+    console.error(err);
+    process.exit(1);
+  });
+
+  await selectionLoop(state);
+  process.exit(0);
 }
 
 main().catch(err => {
+  out(A.altOff + A.showC);
   console.error('\nError:', err.message);
-  rl.close();
   process.exit(1);
 });
