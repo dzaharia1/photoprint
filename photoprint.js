@@ -200,6 +200,8 @@ function render(state) {
   const pct      = Math.min(1, used / state.paperH);
   const left     = Math.max(0, state.paperH - used);
   const unprinted = state.images.filter(i => !i.printed).length;
+  const maxNameLen = state.images.length ? Math.max(...state.images.map(i => i.name.replace(/\.[^.]+$/, '').length)) : 15;
+  const nameW      = Math.max(12, Math.min(maxNameLen, w - 40));
 
   let s = A.clr;
 
@@ -245,29 +247,39 @@ function render(state) {
     let glyph;
     if      (img.selected && img.printed) glyph = `${A.yellow}[*]${A.reset}`;
     else if (img.selected)                glyph = `${A.green}${A.bold}[+]${A.reset}`;
-    else if (img.printed)                 glyph = `${A.gray}[v]${A.reset}`;
+    else if (img.printed)                 glyph = `${A.gray}[p]${A.reset}`;
     else                                  glyph = `${A.gray}[ ]${A.reset}`;
 
     const dot     = img.tag ? ` ${TAG_DOT[img.tag]}` : '  ';
-    const rot     = img.h > img.w ? ' R' : '  ';
     const ph      = printH(img, state.longerDim);
     const dim     = `${state.longerDim.toFixed(1)}x${ph.toFixed(2)}"`;
-    const nameW   = Math.max(10, w - 20);
     const base    = img.name.replace(/\.[^.]+$/, '');
     const nameStr = trunc(base, nameW).padEnd(nameW);
 
+    const leftLen = 9 + nameW + dim.length;
+    const rightStr = img.printed ? 'printed' : '';
+    const rightLen = rightStr.length;
+    const padLen = Math.max(1, (w - 2) - leftLen - rightLen);
+    const pad = ' '.repeat(padLen);
+
     let row;
     if (isGrayed) {
-      row = `${A.gray} ${glyph}${dot} ${nameStr} ${dim}${rot}${A.reset}`;
+      row = `${A.gray} ${glyph}${dot} ${nameStr} ${dim}${pad}${rightStr}${A.reset}`;
     } else if (img.printed && !img.selected) {
-      row = ` ${glyph}${dot} ${A.dim}${nameStr}${A.reset} ${A.gray}${dim} printed${A.reset}`;
+      row = ` ${glyph}${dot} ${A.dim}${nameStr}${A.reset} ${A.gray}${dim}${pad}${rightStr}${A.reset}`;
     } else {
       const nc = img.selected ? `${A.green}${A.bold}` : '';
-      row = ` ${glyph}${dot} ${nc}${nameStr}${A.reset} ${A.gray}${dim}${rot}${A.reset}`;
+      const rc = img.printed ? `${A.gray}printed${A.reset}` : '';
+      row = ` ${glyph}${dot} ${nc}${nameStr}${A.reset} ${A.gray}${dim}${pad}${rc}${A.reset}`;
     }
 
     const cur = isCursor ? `${A.cyan}>${A.reset}` : ' ';
-    s += cur + row + '\n';
+    let line = cur + row;
+    if (isCursor) {
+      const bgStyle = '\x1b[7m'; // reverse video highlight
+      line = bgStyle + line.split(A.reset).join(A.reset + bgStyle) + A.reset;
+    }
+    s += line + '\n';
   }
 
   // Footer (3 lines)
