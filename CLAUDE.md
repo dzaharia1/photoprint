@@ -32,7 +32,7 @@ This is macOS-only by construction. Don't add cross-platform shims unless asked.
 
 The program is two distinct input modes that swap how stdin is read:
 
-1. **Setup** (`setup()`) — line-based input via `readline`. Discovers printers (`getPrinters`) and their CUPS option values (`getPrinterVals` parses `lpoptions -p <printer> -l`). Returns a config object.
+1. **Setup** (`setup()`) — interactive selection inputs (using arrow keys/`j`/`k` in raw mode) and line-based questions. Discovers printers (`getPrinters`) and their CUPS option values (`getPrinterVals` parses `lpoptions -p <printer> -l`). Returns a config object.
 2. **TUI / selection loop** (`selectionLoop`) — raw-mode stdin (`enterRaw`/`exitRaw` toggle `setRawMode` + alternate screen buffer `\x1b[?1049h`). Reads single keypresses (`readKey`) including arrow-key escape sequences, mutates `state`, and re-renders.
 
 `render(state)` builds the entire frame as one string and writes it in a single `out()` call (full clear + redraw each frame — no diffing). Layout reserves `HDR` (5) header lines and `FTR` (3) footer lines; the middle scrolls via `state.scrollOffset`.

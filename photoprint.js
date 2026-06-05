@@ -175,8 +175,7 @@ async function doPrint(batch, cfg, auto) {
     run(`magick "${outTiff}" -resize 900x "${prevJpg}"`);
     run(`open "${prevJpg}"`);
     console.log('Preview opened.\n');
-    const rl = readline.createInterface({ input: process.stdin, output: process.stdout });
-    const ans = await new Promise(r => rl.question('Print? [y/n] > ', a => { rl.close(); r(a.trim()); }));
+    const ans = await ask('Print? [y/n] > ');
     if (!ans.toLowerCase().startsWith('y')) return false;
   }
 
@@ -318,6 +317,74 @@ function readKey() {
   return new Promise(resolve => process.stdin.once('data', resolve));
 }
 
+function ask(prompt) {
+  return new Promise(resolve => {
+    const rl = readline.createInterface({ input: process.stdin, output: process.stdout });
+    rl.question(prompt, ans => {
+      rl.close();
+      resolve(ans.trim());
+    });
+  });
+}
+
+async function choose(prompt, opts) {
+  console.log(`\n${prompt}`);
+  let selected = 0;
+
+  const renderOpts = () => {
+    let s = '';
+    for (let i = 0; i < opts.length; i++) {
+      const isSel = i === selected;
+      const prefix = isSel ? `${A.cyan}>${A.reset} ` : '  ';
+      const label = isSel ? `${A.bold}${opts[i].label}${A.reset}` : `${A.gray}${opts[i].label}${A.reset}`;
+      s += `${prefix}${label}\n`;
+    }
+    out(s);
+  };
+
+  renderOpts();
+
+  const wasRaw = process.stdin.isRaw;
+  if (!wasRaw) {
+    process.stdin.setRawMode(true);
+    process.stdin.resume();
+    process.stdin.setEncoding('utf8');
+  }
+  out(A.hideC);
+
+  try {
+    while (true) {
+      const key = await readKey();
+      if (key === '\x03') { // Ctrl+C
+        out(A.showC);
+        if (!wasRaw) {
+          process.stdin.setRawMode(false);
+          process.stdin.pause();
+        }
+        process.exit(0);
+      }
+      if (key === '\r' || key === '\n') {
+        break;
+      }
+      if (key === '\x1b[A' || key === 'k') { // Up
+        selected = (selected - 1 + opts.length) % opts.length;
+      } else if (key === '\x1b[B' || key === 'j') { // Down
+        selected = (selected + 1) % opts.length;
+      }
+
+      out(`\x1b[${opts.length}A\r\x1b[J`);
+      renderOpts();
+    }
+  } finally {
+    out(A.showC);
+    if (!wasRaw) {
+      process.stdin.setRawMode(false);
+      process.stdin.pause();
+    }
+  }
+  return opts[selected];
+}
+
 // ─── Auto mode ────────────────────────────────────────────────────────────────
 async function autoMode(state) {
   while (true) {
@@ -410,26 +477,13 @@ async function selectionLoop(state) {
   }
 }
 
-// ─── Setup (readline mode) ────────────────────────────────────────────────────
+// ─── Setup (interactive selection mode) ───────────────────────────────────────
 async function setup() {
-  const rl  = readline.createInterface({ input: process.stdin, output: process.stdout });
-  const ask = p => new Promise(r => rl.question(p, a => r(a.trim())));
-  const choose = async (prompt, opts) => {
-    console.log(`\n${prompt}`);
-    opts.forEach((o, i) => console.log(`  ${i + 1}) ${o.label}`));
-    while (true) {
-      const a = await ask('  > ');
-      const n = parseInt(a);
-      if (n >= 1 && n <= opts.length) return opts[n - 1];
-      console.log(`  Enter 1-${opts.length}.`);
-    }
-  };
-
   console.log('\nPhotoprint  --  interactive photo printing\n');
 
   // Printer
   const printers = getPrinters();
-  if (!printers.length) { rl.close(); throw new Error('No printers found.'); }
+  if (!printers.length) { throw new Error('No printers found.'); }
   let printer;
   if (printers.length === 1) {
     printer = printers[0];
@@ -467,7 +521,6 @@ async function setup() {
     inputSlot = (await choose('Paper tray:', slots.map(s => ({ label: s, value: s })))).value;
   }
 
-  rl.close();
   return { printer, longerDim, paperW, paperH, cupsPaperSize, mediaType, inputSlot };
 }
 
