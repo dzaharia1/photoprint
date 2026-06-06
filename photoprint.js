@@ -121,13 +121,89 @@ function printH(img, longerDim) {
   return longerDim * (s / l);
 }
 
-function spaceUsed(imgs, longerDim) {
-  if (!imgs.length) return 0;
-  return imgs.reduce((s, i) => s + printH(i, longerDim), 0) + (imgs.length + 1) * MIN_GAP;
+function simulateLayoutForOrientation(images, cfg, orientation) {
+  const { longerDim, paperW } = cfg;
+  
+  const imgDims = images.map(img => {
+    const ph = printH(img, longerDim);
+    if (orientation === 'landscape') {
+      return { w: longerDim, h: ph, img };
+    } else { // portrait
+      return { w: ph, h: longerDim, img };
+    }
+  });
+
+  const rows = [];
+  let currentRow = [];
+  let currentRowW = MIN_GAP;
+
+  for (const item of imgDims) {
+    if (item.w + 2 * MIN_GAP > paperW) {
+      return { rows: [], totalH: Infinity, rowHeights: [], orientation };
+    }
+
+    if (currentRowW + item.w + MIN_GAP <= paperW) {
+      currentRow.push(item);
+      currentRowW += item.w + MIN_GAP;
+    } else {
+      if (currentRow.length > 0) {
+        rows.push(currentRow);
+      }
+      currentRow = [item];
+      currentRowW = MIN_GAP + item.w + MIN_GAP;
+    }
+  }
+  if (currentRow.length > 0) {
+    rows.push(currentRow);
+  }
+
+  if (rows.length === 0) {
+    return { rows: [], totalH: 0, rowHeights: [], orientation };
+  }
+
+  let totalH = MIN_GAP;
+  const rowHeights = [];
+  for (const row of rows) {
+    const maxH = Math.max(...row.map(item => item.h));
+    rowHeights.push(maxH);
+    totalH += maxH + MIN_GAP;
+  }
+
+  return { rows, totalH, rowHeights, orientation };
 }
 
-function wouldFit(img, selected, longerDim, paperH) {
-  return spaceUsed([...selected, img], longerDim) <= paperH;
+function calculateLayout(images, cfg) {
+  if (!images || !images.length) {
+    return { rows: [], totalH: 0, rowHeights: [], orientation: 'landscape' };
+  }
+
+  const landscapeLayout = simulateLayoutForOrientation(images, cfg, 'landscape');
+  const portraitLayout = simulateLayoutForOrientation(images, cfg, 'portrait');
+
+  if (landscapeLayout.totalH === Infinity && portraitLayout.totalH === Infinity) {
+    return landscapeLayout;
+  }
+
+  const landFits = landscapeLayout.totalH <= cfg.paperH;
+  const portFits = portraitLayout.totalH <= cfg.paperH;
+
+  if (landFits && !portFits) return landscapeLayout;
+  if (portFits && !landFits) return portraitLayout;
+
+  if (portraitLayout.totalH < landscapeLayout.totalH) {
+    return portraitLayout;
+  }
+  return landscapeLayout;
+}
+
+function spaceUsed(imgs, cfg) {
+  const layout = calculateLayout(imgs, cfg);
+  return layout ? layout.totalH : 0;
+}
+
+function wouldFit(img, selected, cfg) {
+  const layout = calculateLayout([...selected, img], cfg);
+  return layout && layout.totalH <= cfg.paperH;
 }
 
 // ─── Composite builder ────────────────────────────────────────────────────────
@@ -135,28 +211,55 @@ function buildComposite(images, cfg, outPath) {
   const { longerDim, paperW, paperH } = cfg;
   const pw = Math.round(paperW * DPI);
   const ph = Math.round(paperH * DPI);
-  const tmps = [], adims = [];
 
-  for (const img of images) {
-    const rotate = img.h > img.w ? '-rotate -90' : '';
-    const tw  = Math.round(longerDim * DPI);
-    const tmp = path.join(os.tmpdir(), `pp_${Date.now()}_${Math.random().toString(36).slice(2)}.tiff`);
-    run(`magick "${img.path}" -auto-orient ${rotate} -resize ${tw}x -units PixelsPerInch -density ${DPI} "${tmp}"`);
-    const d = run(`magick identify -format "%wx%h" "${tmp}"`).split('x').map(Number);
-    tmps.push(tmp);
-    adims.push({ w: d[0], h: d[1] });
+  const layout = calculateLayout(images, cfg);
+  if (!layout) {
+    throw new Error("Images do not fit on the paper size with the current settings.");
   }
 
-  const totalH = adims.reduce((s, d) => s + d.h, 0);
-  const gap    = Math.floor((ph - totalH) / (images.length + 1));
+  const tmps = [];
+  const rowItems = [];
+
+  for (const row of layout.rows) {
+    const preparedRow = [];
+    for (const item of row) {
+      const img = item.img;
+      const rotate = layout.orientation === 'landscape'
+        ? (img.h > img.w ? '-rotate -90' : '')
+        : (img.w > img.h ? '-rotate -90' : '');
+      const tw = Math.round(item.w * DPI);
+      const tmp = path.join(os.tmpdir(), `pp_${Date.now()}_${Math.random().toString(36).slice(2)}.tiff`);
+      run(`magick "${img.path}" -auto-orient ${rotate} -resize ${tw}x -units PixelsPerInch -density ${DPI} "${tmp}"`);
+      const d = run(`magick identify -format "%wx%h" "${tmp}"`).split('x').map(Number);
+      
+      tmps.push(tmp);
+      preparedRow.push({ tmpPath: tmp, w: d[0], h: d[1] });
+    }
+    rowItems.push(preparedRow);
+  }
+
+  const rowHeightsPixels = rowItems.map(row => Math.max(...row.map(item => item.h)));
+  const totalRowsHPixels = rowHeightsPixels.reduce((s, h) => s + h, 0);
+  const vertGap = Math.floor((ph - totalRowsHPixels) / (rowItems.length + 1));
 
   let cmd = `magick -size ${pw}x${ph} xc:white -units PixelsPerInch -density ${DPI}`;
-  let y = gap;
-  for (let i = 0; i < tmps.length; i++) {
-    const x = Math.round((pw - adims[i].w) / 2);
-    cmd += ` "${tmps[i]}" -geometry +${x}+${y} -composite`;
-    y += adims[i].h + gap;
+  let y = vertGap;
+
+  for (let r = 0; r < rowItems.length; r++) {
+    const row = rowItems[r];
+    const rowH = rowHeightsPixels[r];
+    const rowWidthPixels = row.reduce((s, item) => s + item.w, 0);
+    const horizGap = Math.floor((pw - rowWidthPixels) / (row.length + 1));
+
+    let x = horizGap;
+    for (const item of row) {
+      const yCentered = y + Math.round((rowH - item.h) / 2);
+      cmd += ` "${item.tmpPath}" -geometry +${x}+${yCentered} -composite`;
+      x += item.w + horizGap;
+    }
+    y += rowH + vertGap;
   }
+
   cmd += ` "${outPath}"`;
   run(cmd);
   tmps.forEach(f => { try { fs.unlinkSync(f); } catch {} });
@@ -196,9 +299,16 @@ function render(state) {
   const w = TW(), h = TH();
   const listH    = h - HDR - FTR;
   const sel      = state.images.filter(i => i.selected);
-  const used     = spaceUsed(sel, state.longerDim);
+  const used     = spaceUsed(sel, state);
   const pct      = Math.min(1, used / state.paperH);
   const left     = Math.max(0, state.paperH - used);
+
+  const layout   = calculateLayout(sel, state);
+  let layoutStr = '';
+  if (sel.length > 0 && layout && layout.rows.length > 0) {
+    const rowCounts = layout.rows.map(r => r.length).join('+');
+    layoutStr = `Grid: ${rowCounts} (${layout.orientation})`;
+  }
   const unprinted = state.images.filter(i => !i.printed).length;
   const maxNameLen = state.images.length ? Math.max(...state.images.map(i => i.name.replace(/\.[^.]+$/, '').length)) : 15;
   const nameW      = Math.max(12, Math.min(maxNameLen, w - 40));
@@ -219,11 +329,15 @@ function render(state) {
   s += ` ${A.gray}${cfgLine}${A.reset}\n`;
 
   // Line 3: space bar
-  const barW   = Math.max(10, w - 32);
+  const barW   = Math.max(10, w - (layoutStr ? 50 : 32));
   const fill   = Math.round(pct * barW);
   const barCol = pct > 0.95 ? A.red : pct > 0.75 ? A.yellow : A.green;
   s += ` ${barCol}${'#'.repeat(fill)}${A.gray}${'-'.repeat(barW - fill)}${A.reset}`;
-  s += `  ${A.bold}${used.toFixed(2)}"${A.reset} used  ${A.gray}${left.toFixed(2)}" left${A.reset}\n`;
+  s += `  ${A.bold}${used.toFixed(2)}"${A.reset} used  ${A.gray}${left.toFixed(2)}" left${A.reset}`;
+  if (layoutStr) {
+    s += `  ${A.cyan}${layoutStr}${A.reset}`;
+  }
+  s += '\n';
 
   // Line 5: counts
   s += ` ${A.gray}${sel.length} selected  |  ${unprinted} unprinted  |  ${state.images.length} total${A.reset}\n`;
@@ -241,7 +355,7 @@ function render(state) {
     const ai       = state.scrollOffset + vi;
     const isCursor = ai === state.cursor;
     const isGrayed = !img.selected && !img.printed &&
-                     !wouldFit(img, sel, state.longerDim, state.paperH);
+                     !wouldFit(img, sel, state);
 
     // Selection glyph
     let glyph;
@@ -299,7 +413,7 @@ function render(state) {
   // Action line
   const unprintedUnsel = state.images.filter(i => !i.selected && !i.printed);
   const pageFull = sel.length > 0 && unprintedUnsel.length > 0 &&
-    unprintedUnsel.every(i => !wouldFit(i, sel, state.longerDim, state.paperH));
+    unprintedUnsel.every(i => !wouldFit(i, sel, state));
 
   if (pageFull)
     s += ` ${A.orange}${A.bold}Page full — no more images will fit. Press P to print.${A.reset}`;
@@ -406,7 +520,7 @@ async function autoMode(state) {
     state.images.forEach(i => { i.selected = false; });
     for (const img of unprinted) {
       const sel = state.images.filter(i => i.selected);
-      if (wouldFit(img, sel, state.longerDim, state.paperH)) img.selected = true;
+      if (wouldFit(img, sel, state)) img.selected = true;
       else break;
     }
 
@@ -455,7 +569,7 @@ async function selectionLoop(state) {
       const img = state.images[state.cursor];
       if (img.selected) {
         img.selected = false;
-      } else if (img.printed || wouldFit(img, sel(), state.longerDim, state.paperH)) {
+      } else if (img.printed || wouldFit(img, sel(), state)) {
         img.selected = true;
       }
     } else if (key === 'r' || key === 'R') {
@@ -466,7 +580,7 @@ async function selectionLoop(state) {
       if (!allRedSelected) {
         for (const img of redImgs) {
           const cur = state.images.filter(i => i.selected);
-          if (wouldFit(img, cur, state.longerDim, state.paperH)) img.selected = true;
+          if (wouldFit(img, cur, state)) img.selected = true;
         }
       }
 
